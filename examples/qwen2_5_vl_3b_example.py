@@ -34,7 +34,7 @@ messages = [
 res = run_task(
     model="Qwen/Qwen2.5-VL-3B-Instruct",
     messages=messages,
-    generation_config={"max_new_tokens": 256},
+    generation_config={"max_new_tokens": 32768},
     seed=42,
     dtype="float16",
 )

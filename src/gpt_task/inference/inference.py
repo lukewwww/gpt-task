@@ -188,6 +188,19 @@ def _build_prompt_token_baseline(
 
 
 def _extract_generated_text(generated: Any) -> str:
+    def _content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "".join(parts)
+        return ""
+
     if isinstance(generated, str):
         return generated
     if isinstance(generated, list):
@@ -195,14 +208,119 @@ def _extract_generated_text(generated: Any) -> str:
             return ""
         last = generated[-1]
         if isinstance(last, dict):
-            content = last.get("content")
-            if isinstance(content, str):
-                return content
+            return _content_to_text(last.get("content"))
     if isinstance(generated, dict):
-        content = generated.get("content")
-        if isinstance(content, str):
-            return content
+        return _content_to_text(generated.get("content"))
     return ""
+
+
+def _to_token_id_list(token_ids: Any) -> List[int] | None:
+    if token_ids is None:
+        return None
+    if torch.is_tensor(token_ids):
+        if token_ids.ndim == 0:
+            return [int(token_ids.item())]
+        if token_ids.ndim == 1:
+            return [int(x) for x in token_ids.tolist()]
+        return [int(x) for x in token_ids[0].tolist()]
+    if isinstance(token_ids, list):
+        if len(token_ids) == 0:
+            return []
+        if isinstance(token_ids[0], list):
+            return [int(x) for x in token_ids[0]]
+        return [int(x) for x in token_ids]
+    return None
+
+
+def _is_vlm_pipeline(pipe: Any) -> bool:
+    return getattr(pipe, "task", None) == "image-text-to-text"
+
+
+def _invoke_pipeline(
+    pipe: Any,
+    inputs: Union[str, List[Dict[str, Any]]],
+    generation_config: Any,
+    *,
+    return_tensors: bool = False,
+    streamer: BaseStreamer | None = None,
+) -> Any:
+    call_kwargs: Dict[str, Any] = {}
+    if return_tensors:
+        call_kwargs["return_tensors"] = True
+
+    # Both TextGenerationPipeline and ImageTextToTextPipeline fall back to
+    # self.generation_config when no generation_config is passed through the
+    # call. Setting it directly avoids the inconsistent parameter routing
+    # between the two pipeline types (flat kwargs vs generate_kwargs dict).
+    
+    # Save and restore: the pipe object may be cached and reused across
+    # calls (via model_cache), so we must not leave a modified
+    # generation_config on it after we return.
+    saved_generation_config = pipe.generation_config
+    pipe.generation_config = generation_config
+
+    try:
+        if streamer is not None:
+            # streamer is a runtime arg for model.generate(), not part of
+            # GenerationConfig. TextGenerationPipeline accepts it as a flat
+            # kwarg; ImageTextToTextPipeline requires it inside a
+            # generate_kwargs dict — an upstream API inconsistency.
+            if _is_vlm_pipeline(pipe):
+                call_kwargs["generate_kwargs"] = {"streamer": streamer}
+            else:
+                call_kwargs["streamer"] = streamer
+        return pipe(inputs, **call_kwargs)
+    finally:
+        pipe.generation_config = saved_generation_config
+
+
+def _resolve_prompt_input_tokens(
+    pipe: Any,
+    tokenizer: Any,
+    inputs: Union[str, List[Dict[str, Any]]],
+    messages: Sequence[models.Message],
+) -> List[int]:
+    baseline = _build_prompt_token_baseline(tokenizer, inputs, messages)
+
+    processor = getattr(pipe, "processor", None)
+    if isinstance(inputs, list) and processor is not None and hasattr(processor, "apply_chat_template"):
+        try:
+            chat_inputs = processor.apply_chat_template(
+                inputs,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            resolved_chat = _to_token_id_list(chat_inputs.get("input_ids"))
+            if resolved_chat is not None and len(resolved_chat) > 0:
+                return resolved_chat
+        except Exception:
+            pass
+
+    preprocess = getattr(pipe, "preprocess", None)
+    if preprocess is None:
+        return baseline
+
+    try:
+        model_inputs = preprocess(inputs)
+    except Exception:
+        return baseline
+
+    if not isinstance(model_inputs, dict):
+        return baseline
+
+    input_ids = model_inputs.get("input_ids")
+    if input_ids is None:
+        input_ids = model_inputs.get("decoder_input_ids")
+
+    resolved = _to_token_id_list(input_ids)
+    if resolved is None and torch.is_tensor(input_ids) and input_ids.ndim == 2:
+        resolved = _to_token_id_list(input_ids[0])
+
+    if resolved is not None and len(resolved) > 0:
+        return resolved
+    return baseline
 
 
 @wrap_error
@@ -329,20 +447,19 @@ def run_task(
     _logger.debug(f"Generation config: {resolved_generation_config}")
     _logger.debug(f"Input text: {inputs}")
 
-    input_tokens = _build_prompt_token_baseline(tokenizer, inputs, args.messages)
+    input_tokens = _resolve_prompt_input_tokens(pipe, tokenizer, inputs, args.messages)
 
     if stream_callback is not None:
-        # Create a callback-based streamer
         streamer = TokenStreamer(tokenizer, input_tokens, args.model, stream_callback)
-        stream_kwargs = {
-            "streamer": streamer,
-            "pad_token_id": tokenizer.eos_token_id,
-            "use_cache": True,
-        }
+        resolved_generation_config.pad_token_id = tokenizer.eos_token_id
+        resolved_generation_config.use_cache = True
 
-        # Run the pipe function directly - it will call the streamer's put method
-        # which will in turn call the stream_callback for each token
-        pipe(inputs, generation_config=resolved_generation_config, **stream_kwargs)
+        _invoke_pipeline(
+            pipe,
+            inputs,
+            resolved_generation_config,
+            streamer=streamer,
+        )
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -352,10 +469,11 @@ def run_task(
         # Return None since we're using callbacks instead of returning a generator
         return None
 
-    output = pipe(
+    output = _invoke_pipeline(
+        pipe,
         inputs,
+        resolved_generation_config,
         return_tensors=True,
-        generation_config=resolved_generation_config,
     )
     assert output is not None
     assert isinstance(output, list)
@@ -365,11 +483,11 @@ def run_task(
     generations: List[Dict[str, Any]] = []
     for single in output:
         assert isinstance(single, dict)
-        token_ids = single.get("generated_token_ids")
+        token_ids = _to_token_id_list(single.get("generated_token_ids"))
         generated_text = _extract_generated_text(single.get("generated_text"))
         generations.append(
             {
-                "token_ids": token_ids if isinstance(token_ids, list) else None,
+                "token_ids": token_ids,
                 "generated_text": generated_text,
             }
         )
